@@ -37,7 +37,7 @@ else
 fi
 
 cd "$repo_root"
-git submodule update --init --recursive
+"$repo_root/ios/ensure-submodules.sh"
 "$repo_root/ios/apply-sdk-patches.sh"
 
 # 1. Host codegen (macOS). Produces generated/ in the source tree.

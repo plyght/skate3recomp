@@ -25,8 +25,11 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      # Not `submodules: recursive`: the SDK's pinned ImGui commit is gone
+      # upstream; the script initializes everything else and falls back.
+      - name: Initialize submodules
+        run: ios/ensure-submodules.sh
 
       - name: Select Xcode with the iOS 26 SDK
         uses: maxim-lobanov/setup-xcode@v1
