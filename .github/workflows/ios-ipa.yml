@@ -1,17 +1,18 @@
-# Builds Skate3Recomp.ipa in the cloud from YOUR game files, so no local Mac
-# build is needed. Run it from the Actions tab ("Run workflow").
+# Builds Skate3Recomp.ipa in the cloud from YOUR copy of the game - no Mac
+# needed. Everything can be done from a phone:
+#   1. Share your Skate 3 ISO from iCloud Drive / Google Drive / Dropbox and
+#      save its direct download link as the secret SKATE3_ISO_URL.
+#   2. Actions > "iOS app" > Run workflow.
+#   3. Download the Skate3Recomp-ipa artifact and open it in SideStore.
 #
-# This repository is public, so nothing game-derived is ever stored or
-# uploaded in the clear:
-# - the inputs (default.xex, EAWebkit.xex, title update) arrive as an
-#   AES-encrypted archive made by ios/pack-game-files.py, fetched from a link
-#   you keep in a secret;
-# - the finished .ipa is encrypted with your password before it is uploaded,
-#   and the artifact expires after 3 days.
+# Only default.xex and EAWebkit.xex are taken from the ISO (the rest of the
+# disc is read on the device later); the title update is downloaded from the
+# same source the desktop installer uses.
 #
-# Required repository secrets (Settings > Secrets and variables > Actions):
-#   SKATE3_FILES_URL       direct download link to skate3-build-inputs.enc
-#   SKATE3_FILES_PASSWORD  the password you chose when packing
+# In a PRIVATE repository the .ipa is uploaded as-is. In a public one the
+# artifact would be downloadable by anyone, so the workflow then requires the
+# secret SKATE3_FILES_PASSWORD and uploads the .ipa encrypted with it
+# (decrypt with ios/decrypt-ipa.sh).
 name: iOS app (.ipa from your game files)
 
 on:
@@ -34,8 +35,10 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 360
     env:
+      SKATE3_ISO_URL: ${{ secrets.SKATE3_ISO_URL }}
       SKATE3_FILES_URL: ${{ secrets.SKATE3_FILES_URL }}
       SKATE3_FILES_PASSWORD: ${{ secrets.SKATE3_FILES_PASSWORD }}
+      REPO_PRIVATE: ${{ github.event.repository.private }}
       # Keep compiler diagnostics (which quote recompiled code) out of the
       # public log, and stay within the runner's 7 GB of RAM.
       CXXFLAGS: -w
@@ -43,8 +46,12 @@ jobs:
     steps:
       - name: Check secrets
         run: |
-          if [[ -z "$SKATE3_FILES_URL" || -z "$SKATE3_FILES_PASSWORD" ]]; then
-            echo "::error::Add the SKATE3_FILES_URL and SKATE3_FILES_PASSWORD secrets first (see README, iOS cloud build)."
+          if [[ -z "$SKATE3_ISO_URL" && -z "$SKATE3_FILES_URL" ]]; then
+            echo "::error::Add the secret SKATE3_ISO_URL (a direct download link to your Skate 3 ISO)."
+            exit 1
+          fi
+          if [[ "$REPO_PRIVATE" != "true" && -z "$SKATE3_FILES_PASSWORD" ]]; then
+            echo "::error::This repository is public, so the .ipa must be encrypted: add the secret SKATE3_FILES_PASSWORD, or make the repository private."
             exit 1
           fi
 
@@ -61,17 +68,38 @@ jobs:
       - name: Install toolchain
         run: brew install llvm ninja
 
-      - name: Fetch and decrypt your game files
+      - name: Fetch your game files
         run: |
           inputs="$RUNNER_TEMP/game"
-          mkdir -p "$inputs"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/inputs.enc" "$SKATE3_FILES_URL"
-          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 \
-            -pass env:SKATE3_FILES_PASSWORD -in "$RUNNER_TEMP/inputs.enc" \
-            | tar -xzf - -C "$inputs"
-          rm -f "$RUNNER_TEMP/inputs.enc"
+          mkdir -p "$inputs/data/webkit"
+          if [[ -n "$SKATE3_ISO_URL" ]]; then
+            # Pull the two executables out of the ISO, then delete it right away
+            # (runner disk is limited and nothing else from the disc is needed).
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/game.iso" "$SKATE3_ISO_URL"
+            python3 -I - "$RUNNER_TEMP/game.iso" "$inputs" ios/pack-game-files.py <<'PY'
+          import importlib.util, pathlib, sys
+          iso, out, packer = sys.argv[1:4]
+          spec = importlib.util.spec_from_file_location("packer", packer)
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          for name, data in mod.find_files(iso).items():
+              path = pathlib.Path(out) / name
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(data)
+          PY
+            rm -f "$RUNNER_TEMP/game.iso"
+            curl -fsSL --retry 3 -o "$inputs/TU_12K2276_000000C000000.00000000000O3" \
+              "https://xboxunity.net/Resources/Lib/TitleUpdate.php?tuid=21774"
+          else
+            # Pre-packed archive from ios/pack-game-files.py.
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/inputs.enc" "$SKATE3_FILES_URL"
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 \
+              -pass env:SKATE3_FILES_PASSWORD -in "$RUNNER_TEMP/inputs.enc" \
+              | tar -xzf - -C "$inputs"
+            rm -f "$RUNNER_TEMP/inputs.enc"
+          fi
           test -f "$inputs/default.xex" -a -f "$inputs/data/webkit/EAWebkit.xex" \
-            || { echo "::error::Archive is missing the .xex files; repack it with ios/pack-game-files.py"; exit 1; }
+            || { echo "::error::Could not get default.xex / EAWebkit.xex from your files"; exit 1; }
 
       - name: Build the app
         run: |
@@ -81,20 +109,26 @@ jobs:
           fi
           ios/build.sh "${args[@]}"
 
-      - name: Encrypt the .ipa
+      - name: Prepare the .ipa for upload
         run: |
-          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt \
-            -pass env:SKATE3_FILES_PASSWORD \
-            -in out/build/ios-release/Skate3Recomp.ipa \
-            -out "$RUNNER_TEMP/Skate3Recomp.ipa.enc"
+          if [[ "$REPO_PRIVATE" == "true" ]]; then
+            cp out/build/ios-release/Skate3Recomp.ipa "$RUNNER_TEMP/Skate3Recomp.ipa"
+          else
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt \
+              -pass env:SKATE3_FILES_PASSWORD \
+              -in out/build/ios-release/Skate3Recomp.ipa \
+              -out "$RUNNER_TEMP/Skate3Recomp.ipa.enc"
+          fi
 
       - name: Remove plaintext game-derived files
         if: always()
-        run: rm -rf "$RUNNER_TEMP/game" generated out/build
+        run: rm -rf "$RUNNER_TEMP/game" "$RUNNER_TEMP/game.iso" generated out/build
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Skate3Recomp-ipa-encrypted
-          path: ${{ runner.temp }}/Skate3Recomp.ipa.enc
+          name: Skate3Recomp-ipa
+          path: |
+            ${{ runner.temp }}/Skate3Recomp.ipa
+            ${{ runner.temp }}/Skate3Recomp.ipa.enc
           retention-days: 3
           if-no-files-found: error
