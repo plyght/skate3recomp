@@ -1,0 +1,178 @@
+diff --git a/include/rex/platform.h b/include/rex/platform.h
+index 57d8cf6..e65dcdc 100644
+--- a/include/rex/platform.h
++++ b/include/rex/platform.h
+@@ -29,7 +29,13 @@
+ #endif
+ 
+ #if defined(TARGET_OS_MAC) && TARGET_OS_MAC
++// REX_PLATFORM_MAC covers every Darwin target (TARGET_OS_MAC is also set on
++// iOS). REX_PLATFORM_IOS narrows to iPhone/iPad, where AppKit, dlopen of
++// loose dylibs, ucontext and process relaunch are unavailable.
+ #define REX_PLATFORM_MAC 1
++#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
++#define REX_PLATFORM_IOS 1
++#endif
+ #elif defined(WIN32) || defined(_WIN32)
+ #define REX_PLATFORM_WIN32 1
+ #elif defined(__ANDROID__)
+@@ -47,6 +53,9 @@
+ #ifndef REX_PLATFORM_MAC
+ #define REX_PLATFORM_MAC 0
+ #endif
++#ifndef REX_PLATFORM_IOS
++#define REX_PLATFORM_IOS 0
++#endif
+ #ifndef REX_PLATFORM_WIN32
+ #define REX_PLATFORM_WIN32 0
+ #endif
+diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
+index c80e029..df5bf54 100644
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -63,12 +63,15 @@ struct Fiber {
+ 
+   static void Trampoline();
+ #elif REX_PLATFORM_MAC
++  // ucontext_t* on macOS; the saved stack pointer on iOS.
+   void* context_ = nullptr;
+   std::vector<uint8_t> stack_;
+   void (*entry_)(void*) = nullptr;
+   void* arg_ = nullptr;
+   bool is_thread_fiber_ = false;
+ 
++ public:
++  // Public so the iOS assembly entry thunk can reach it.
+   static void Trampoline();
+ #endif
+ };
+diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
+index 467c426..8d7fc3c 100644
+--- a/src/core/fiber_posix.cpp
++++ b/src/core/fiber_posix.cpp
+@@ -1,6 +1,8 @@
+ /**
+  * @file        rex/core/fiber_posix.cpp
+- * @brief       POSIX backend for rex::thread::Fiber (makecontext/swapcontext)
++ * @brief       POSIX backend for rex::thread::Fiber (makecontext/swapcontext,
++ *              or a hand-written arm64 context switch on iOS where the
++ *              ucontext family is unavailable)
+  *
+  * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
+  *              All rights reserved.
+@@ -14,7 +16,108 @@
+ #endif
+ 
+ #include <rex/platform.h>
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_IOS
++
++#include <rex/thread/fiber.h>
++
++#include <cassert>
++#include <cstdint>
++
++// iOS marks getcontext/makecontext/swapcontext unavailable, so fibers switch
++// stacks directly. context_ holds the suspended fiber's saved stack pointer;
++// the callee-saved state (x19-x30, d8-d15) lives in a 160-byte frame on that
++// stack, written by rex_fiber_switch on the way out and popped on the way in.
++extern "C" void rex_fiber_switch(void** save_sp, void* load_sp);
++extern "C" void rex_fiber_entry();
++
++__asm__(
++    ".text\n"
++    ".p2align 2\n"
++    ".globl _rex_fiber_switch\n"
++    "_rex_fiber_switch:\n"
++    "  sub sp, sp, #160\n"
++    "  stp x19, x20, [sp, #0]\n"
++    "  stp x21, x22, [sp, #16]\n"
++    "  stp x23, x24, [sp, #32]\n"
++    "  stp x25, x26, [sp, #48]\n"
++    "  stp x27, x28, [sp, #64]\n"
++    "  stp x29, x30, [sp, #80]\n"
++    "  stp d8, d9, [sp, #96]\n"
++    "  stp d10, d11, [sp, #112]\n"
++    "  stp d12, d13, [sp, #128]\n"
++    "  stp d14, d15, [sp, #144]\n"
++    "  mov x9, sp\n"
++    "  str x9, [x0]\n"
++    "  mov sp, x1\n"
++    "  ldp x19, x20, [sp, #0]\n"
++    "  ldp x21, x22, [sp, #16]\n"
++    "  ldp x23, x24, [sp, #32]\n"
++    "  ldp x25, x26, [sp, #48]\n"
++    "  ldp x27, x28, [sp, #64]\n"
++    "  ldp x29, x30, [sp, #80]\n"
++    "  ldp d8, d9, [sp, #96]\n"
++    "  ldp d10, d11, [sp, #112]\n"
++    "  ldp d12, d13, [sp, #128]\n"
++    "  ldp d14, d15, [sp, #144]\n"
++    "  add sp, sp, #160\n"
++    "  ret\n");
++
++namespace rex::thread {
++
++thread_local Fiber* Fiber::tls_current_ = nullptr;
++
++Fiber* Fiber::ConvertCurrentThread() {
++  auto* f = new Fiber();
++  f->is_thread_fiber_ = true;
++  tls_current_ = f;
++  return f;
++}
++
++Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
++  constexpr size_t kFrameSize = 160;
++  auto* f = new Fiber();
++  f->entry_ = entry;
++  f->arg_ = arg;
++  f->stack_.resize(stack_size);
++  auto top = reinterpret_cast<uintptr_t>(f->stack_.data() + f->stack_.size()) & ~uintptr_t(15);
++  auto* frame = reinterpret_cast<uint64_t*>(top - kFrameSize);
++  for (size_t i = 0; i < kFrameSize / sizeof(uint64_t); ++i) {
++    frame[i] = 0;
++  }
++  // x30 slot: the first switch into this fiber "returns" into the entry thunk.
++  frame[11] = reinterpret_cast<uint64_t>(&rex_fiber_entry);
++  f->context_ = frame;
++  return f;
++}
++
++/*static*/ void Fiber::Trampoline() {
++  // tls_current_ was updated by SwitchTo before the stack switch landed here.
++  Fiber* f = tls_current_;
++  f->entry_(f->arg_);
++  // Guest fiber entries never return; falling off would resume garbage.
++  __builtin_trap();
++}
++
++void Fiber::SwitchTo(Fiber* target) {
++  Fiber* from = tls_current_;
++  tls_current_ = target;
++  rex_fiber_switch(&from->context_, target->context_);
++}
++
++void Fiber::Destroy() {
++  if (is_thread_fiber_) {
++    tls_current_ = nullptr;
++  } else {
++    assert(this != tls_current_ && "Destroy called on the currently running fiber");
++  }
++  delete this;
++}
++
++}  // namespace rex::thread
++
++extern "C" void rex_fiber_entry() { rex::thread::Fiber::Trampoline(); }
++
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+ 
+ #include <rex/thread/fiber.h>
+ 
+@@ -106,4 +209,4 @@ void Fiber::Destroy() {
+ 
+ }  // namespace rex::thread
+ 
+-#endif  // REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#endif  // REX_PLATFORM_IOS / REX_PLATFORM_LINUX || REX_PLATFORM_MAC
