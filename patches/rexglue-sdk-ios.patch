@@ -245,6 +245,19 @@ index 7810986..2c1f3d8 100644
    // Round trips are not guaranteed to return the same results.
    static constexpr uint32_t ConvertSizeDpi(uint32_t size, uint32_t new_dpi, uint32_t old_dpi) {
      // Always rounding up to prevent zero sizes (unless the input is zero) as
+diff --git a/include/rex/ui/window_sdl.h b/include/rex/ui/window_sdl.h
+index 644fb47..87f66db 100644
+--- a/include/rex/ui/window_sdl.h
++++ b/include/rex/ui/window_sdl.h
+@@ -54,6 +54,8 @@ class SDLWindow final : public Window {
+                          WindowDestructionReceiver& destruction_receiver);
+   void HandleMouseWheel(const SDL_MouseWheelEvent& event,
+                         WindowDestructionReceiver& destruction_receiver);
++  void HandleFinger(const SDL_TouchFingerEvent& event, uint32_t type,
++                    WindowDestructionReceiver& destruction_receiver);
+   void HandleTextInput(const SDL_TextInputEvent& event,
+                        WindowDestructionReceiver& destruction_receiver);
+   void RevealAutoHiddenCursor();
 diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
 index 467c426..8d7fc3c 100644
 --- a/src/core/fiber_posix.cpp
@@ -1045,6 +1058,79 @@ index 11a6e15..745cd06 100644
    // 4 FPS of margin or 5% of the refresh rate, whichever is larger (see the
    // declaration): 4 FPS is 6.7% of headroom at 60 Hz but only 0.2 ms of
    // present slack at 144 Hz, within routine thread-scheduling jitter.
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 5a0f46f..be314f9 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -394,6 +394,12 @@ void SDLWindow::HandleSDLEvent(const SDL_Event& event) {
+     case SDL_EVENT_MOUSE_WHEEL:
+       window_id = event.wheel.windowID;
+       break;
++    case SDL_EVENT_FINGER_DOWN:
++    case SDL_EVENT_FINGER_UP:
++    case SDL_EVENT_FINGER_MOTION:
++    case SDL_EVENT_FINGER_CANCELED:
++      window_id = event.tfinger.windowID;
++      break;
+     default:
+       return;
+   }
+@@ -624,11 +630,55 @@ void SDLWindow::HandleEvent(const SDL_Event& event) {
+     case SDL_EVENT_MOUSE_WHEEL:
+       HandleMouseWheel(event.wheel, destruction_receiver);
+       break;
++    case SDL_EVENT_FINGER_DOWN:
++    case SDL_EVENT_FINGER_UP:
++    case SDL_EVENT_FINGER_MOTION:
++    case SDL_EVENT_FINGER_CANCELED:
++      HandleFinger(event.tfinger, event.type, destruction_receiver);
++      break;
+     default:
+       break;
+   }
+ }
+ 
++void SDLWindow::HandleFinger(const SDL_TouchFingerEvent& event, uint32_t type,
++                             WindowDestructionReceiver& destruction_receiver) {
++  // SDL reports finger positions normalized to the window; listeners (imgui,
++  // touch controls) work in physical pixels like mouse events do.
++  // Only touchscreens: macOS trackpads also report (indirect) fingers, which
++  // must keep acting as a mouse rather than as taps at absolute positions.
++  if (SDL_GetTouchDeviceType(event.touchID) != SDL_TOUCH_DEVICE_DIRECT) {
++    return;
++  }
++  int width = 0;
++  int height = 0;
++  if (!window_ || !SDL_GetWindowSizeInPixels(window_, &width, &height)) {
++    return;
++  }
++  TouchEvent::Action action = TouchEvent::Action::kMove;
++  switch (type) {
++    case SDL_EVENT_FINGER_DOWN:
++      action = TouchEvent::Action::kDown;
++      break;
++    case SDL_EVENT_FINGER_UP:
++      action = TouchEvent::Action::kUp;
++      break;
++    case SDL_EVENT_FINGER_CANCELED:
++      action = TouchEvent::Action::kCancel;
++      break;
++    default:
++      break;
++  }
++  // Finger IDs are only unique while down; the low 32 bits are enough to tell
++  // concurrent fingers apart. kPointerIDNone is reserved.
++  uint32_t pointer_id = uint32_t(event.fingerID);
++  if (pointer_id == TouchEvent::kPointerIDNone) {
++    pointer_id = 0;
++  }
++  TouchEvent e(this, pointer_id, action, event.x * float(width), event.y * float(height));
++  OnTouchEvent(e, destruction_receiver);
++}
++
+ void SDLWindow::HandleSizeUpdate(WindowDestructionReceiver& destruction_receiver) {
+   dpi_ = QueryDpi();
+   int width = 0;
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
 index a8bfad9..de930b6 100644
 --- a/src/ui/windowed_app_main_sdl.cpp

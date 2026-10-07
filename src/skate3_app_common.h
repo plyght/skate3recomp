@@ -30,6 +30,9 @@ class Skate3BaseApp : public rex::ReXApp {
       std::function<void(rex::PathConfig)> resume) override;
   void OnConfigurePaths(rex::PathConfig& paths) override;
   void OnConfigureFonts(ImFontAtlas* atlas) override;
+#if REX_PLATFORM_IOS
+  void OnPreSetup(rex::RuntimeConfig& config) override;
+#endif
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override;
   void OnPostSetup() override;
   void OnShutdown() override;

@@ -10,6 +10,10 @@
 #include "skate3_win_icon.h"
 #include "skate3_title_update_installer.h"
 #include "skate3_user_settings.h"
+#if REX_PLATFORM_IOS
+#include "skate3_touch_controls.h"
+#include <rex/input/input_system.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -735,7 +739,36 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   return runtime_paths;
 }
 
+#if REX_PLATFORM_IOS
+void Skate3BaseApp::OnPreSetup(rex::RuntimeConfig& config) {
+  // Register the touch pad driver inside the input factory: drivers must all
+  // exist before the runtime starts polling input from guest threads.
+  auto default_factory = std::move(config.input_factory);
+  config.input_factory =
+      [default_factory = std::move(default_factory)](
+          bool tool_mode) -> std::unique_ptr<rex::system::IInputSystem> {
+    auto base = default_factory ? default_factory(tool_mode) : nullptr;
+    if (tool_mode || !base) {
+      return base;
+    }
+    std::unique_ptr<rex::input::InputSystem> input(
+        static_cast<rex::input::InputSystem*>(base.release()));
+    return skate3::touch::AddTouchDriver(std::move(input));
+  };
+}
+#endif
+
 void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
+#if REX_PLATFORM_IOS
+  skate3::touch::Attach(
+      drawer, window(), DefaultDocumentsUserRoot() / "touch_layout.toml",
+      skate3::touch::Callbacks{
+          // Deferred: the overlay asks from inside the imgui draw pass, which
+          // must not add or remove dialogs mid-iteration.
+          [this]() { app_context().CallInUIThreadDeferred([this]() { ToggleSimpleSettings(); }); },
+          [this]() { return simple_settings_dialog_ && simple_settings_dialog_->visible(); },
+      });
+#endif
   // Native/emulated corner readout (top right; off by default, cvar
   // skate3_native_render_mode_indicator shows it live). Input-transparent,
   // so it never affects cursor or focus handling.
@@ -873,6 +906,9 @@ void Skate3BaseApp::OnPostSetup() {
 }
 
 void Skate3BaseApp::OnShutdown() {
+#if REX_PLATFORM_IOS
+  skate3::touch::Detach();
+#endif
   rex::ui::UnregisterBind("bind_skate3_menu");
   rex::ui::UnregisterBind("bind_skate3_menu_alt");
   rex::ui::UnregisterBind("bind_skate3_save_draw_fingerprints");
