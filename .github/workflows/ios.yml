@@ -52,6 +52,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/ios.toolchain.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
             -DREXGLUE_USE_VULKAN=ON \
+            -DREXGLUE_ENABLE_TRACY=OFF -DREXGLUE_ENABLE_PERF_COUNTERS=OFF \
             -DREXGLUE_MOLTENVK_XCFRAMEWORK="${{ steps.moltenvk.outputs.xcframework }}"
 
       - name: Build the runtime
