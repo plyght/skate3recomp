@@ -1,8 +1,9 @@
 # Builds Skate3Recomp.ipa in the cloud from YOUR copy of the game - no Mac
 # needed. Everything can be done from a phone:
-#   1. Share your Skate 3 ISO from iCloud Drive / Google Drive / Dropbox and
-#      save its direct download link as the secret SKATE3_ISO_URL.
-#   2. Actions > "iOS app" > Run workflow.
+#   1. Share your Skate 3 ISO from iCloud Drive / Google Drive / Dropbox.
+#   2. Actions > "iOS app" > Run workflow, and paste its direct download link
+#      (or store the link as the secret SKATE3_ISO_URL - required to keep it
+#      hidden in a public repository).
 #   3. Download the Skate3Recomp-ipa artifact and open it in SideStore.
 #
 # Only default.xex and EAWebkit.xex are taken from the ISO (the rest of the
@@ -18,6 +19,10 @@ name: iOS app (.ipa from your game files)
 on:
   workflow_dispatch:
     inputs:
+      iso_url:
+        description: "Direct download link to your Skate 3 ISO (or leave empty to use the SKATE3_ISO_URL secret). Visible to anyone who can see this run - use the secret in a public repo."
+        type: string
+        required: false
       extended_va:
         description: "Request extended virtual addressing (paid Apple developer account only)"
         type: boolean
@@ -35,7 +40,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 360
     env:
-      SKATE3_ISO_URL: ${{ secrets.SKATE3_ISO_URL }}
+      SKATE3_ISO_URL: ${{ inputs.iso_url || secrets.SKATE3_ISO_URL }}
       SKATE3_FILES_URL: ${{ secrets.SKATE3_FILES_URL }}
       SKATE3_FILES_PASSWORD: ${{ secrets.SKATE3_FILES_PASSWORD }}
       REPO_PRIVATE: ${{ github.event.repository.private }}
