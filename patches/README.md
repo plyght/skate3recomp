@@ -11,3 +11,10 @@ To apply by hand:
 ```sh
 git -C third_party/rexglue-sdk apply ../../patches/rexglue-sdk-ios.patch
 ```
+
+To regenerate after editing the SDK checkout (submodule pointers must stay out
+of the patch):
+
+```sh
+git -C third_party/rexglue-sdk diff --ignore-submodules=all > patches/rexglue-sdk-ios.patch
+```

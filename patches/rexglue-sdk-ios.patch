@@ -1182,17 +1182,3 @@ index a8bfad9..de930b6 100644
    // Use native macOS fullscreen so the menu bar and app switching behave like
    // other Mac apps. MoltenVK presentation is paced separately on macOS.
    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "1");
-diff --git a/thirdparty/imgui b/thirdparty/imgui
-index cdda623..2859f67 160000
---- a/thirdparty/imgui
-+++ b/thirdparty/imgui
-@@ -1 +1 @@
--Subproject commit cdda62349d6068e906c2e0ee340d6ec31eedbb9c
-+Subproject commit 2859f6723c13de3a9661b8087fb7919fa3796813-dirty
-diff --git a/thirdparty/sdl3 b/thirdparty/sdl3
-index 8bf3b72..e4af6f8 160000
---- a/thirdparty/sdl3
-+++ b/thirdparty/sdl3
-@@ -1 +1 @@
--Subproject commit 8bf3b7215ad9fc3deb583c6a3a37c6c67f2e24e4
-+Subproject commit e4af6f8e283812aa693eb2c70c91249a9e1ce92c-dirty
