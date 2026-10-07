@@ -152,7 +152,7 @@ index 57d8cf6..e65dcdc 100644
  #define REX_PLATFORM_WIN32 0
  #endif
 diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
-index 2a2ec90..3dd633a 100644
+index 2a2ec90..a684d36 100644
 --- a/include/rex/rex_app.h
 +++ b/include/rex/rex_app.h
 @@ -204,6 +204,13 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
@@ -169,13 +169,16 @@ index 2a2ec90..3dd633a 100644
   private:
    std::function<void(PathConfig)> MakeResumeCallback();
  
-@@ -231,6 +238,10 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
+@@ -231,6 +238,13 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
  #endif
    std::thread module_thread_;
    std::atomic<bool> shutting_down_{false};
 +#if REX_PLATFORM_IOS
 +  bool backgrounded_ = false;
 +  bool lifecycle_watch_installed_ = false;
++  // Pauses run here so a GPU thread busy in a guest wait can't stall the main
++  // thread past the iOS background watchdog.
++  std::thread lifecycle_thread_;
 +#endif
    std::unique_ptr<ui::ImmediateDrawer> immediate_drawer_;
    std::unique_ptr<ui::ImGuiDrawer> imgui_drawer_;
@@ -855,7 +858,7 @@ index 50a26d0..764f9a9 100644
  #else
    if (!ui_font_) {
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index 30ac56f..d732ae5 100644
+index 30ac56f..58797df 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -53,6 +53,10 @@
@@ -869,7 +872,15 @@ index 30ac56f..d732ae5 100644
  #include <fmt/format.h>
  #include <imgui.h>
  #include <toml++/toml.hpp>
-@@ -503,6 +507,24 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+@@ -64,6 +68,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
++#include <future>
+ #include <optional>
+ #include <string_view>
+ #include <thread>
+@@ -503,6 +508,24 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
      static_cast<rex::input::InputSystem*>(runtime_->input_system())->AttachWindow(window_.get());
    }
  
@@ -894,7 +905,7 @@ index 30ac56f..d732ae5 100644
    if (ppc_info_.register_modules) {
      ppc_info_.register_modules(runtime_->kernel_state());
    }
-@@ -827,6 +849,34 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
+@@ -827,7 +850,55 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
    app_context().QuitFromUIThread();
  }
  
@@ -908,12 +919,27 @@ index 30ac56f..d732ae5 100644
 +  auto* audio = static_cast<rex::audio::AudioSystem*>(runtime_->audio_system());
 +  REXLOG_INFO("iOS: app {} - {} GPU and audio", backgrounded ? "backgrounded" : "foregrounded",
 +              backgrounded ? "pausing" : "resuming");
++  if (lifecycle_thread_.joinable()) {
++    // A previous pause must have landed before resuming (or pausing again).
++    lifecycle_thread_.join();
++  }
 +  if (backgrounded) {
-+    if (audio) {
-+      audio->Pause();
-+    }
-+    if (graphics) {
-+      graphics->Pause();
++    auto done = std::make_shared<std::promise<void>>();
++    auto finished = done->get_future();
++    lifecycle_thread_ = std::thread([graphics, audio, done]() {
++      if (audio) {
++        audio->Pause();
++      }
++      if (graphics) {
++        graphics->Pause();
++      }
++      done->set_value();
++    });
++    // UIKit allows a few seconds for backgrounding; bound the wait well inside
++    // that. If the GPU thread is still inside a guest wait, the pause lands as
++    // soon as it returns to its loop.
++    if (finished.wait_for(std::chrono::milliseconds(1500)) != std::future_status::ready) {
++      REXLOG_WARN("iOS: GPU pause still pending after 1.5 s; continuing to background");
 +    }
 +  } else {
 +    if (graphics) {
@@ -927,8 +953,14 @@ index 30ac56f..d732ae5 100644
 +#endif
 +
  void ReXApp::OnDestroy() {
++#if REX_PLATFORM_IOS
++  if (lifecycle_thread_.joinable()) {
++    lifecycle_thread_.detach();
++  }
++#endif
    // Notify subclass before cleanup
    OnShutdown();
+ 
 diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
 index 1e05474..f2d9f52 100644
 --- a/src/ui/vulkan/vulkan_instance.cpp
