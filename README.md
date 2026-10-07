@@ -4,7 +4,7 @@
   <img alt="Skate 3 Native PC Recompilation" src="banner-light.png">
 </picture>
 
-An unofficial native recompilation of the Xbox 360 version of Skate 3, supporting Windows, Linux, and macOS.
+An unofficial native recompilation of the Xbox 360 version of Skate 3, supporting Windows, Linux, macOS, and (experimentally, self-built) iOS.
 
 As of v2.0.0, the game runs on a native renderer built directly on Direct3D 12 and Vulkan instead of emulating the Xbox 360 GPU. Compared to the emulated renderer it delivers more than twice the frame rate at roughly a quarter of the GPU power draw, and on Apple Silicon the frame rate uplift is closer to 10x.
 
@@ -56,6 +56,16 @@ Notes:
 6. Wait for the installer to extract the game files.
 7. Click "Start Game".
 
+### iOS / iPadOS (Experimental, build it yourself)
+
+The iOS version has to be built on your own Mac from your own disc, because the
+app contains code recompiled from it. See [iOS Build](#ios-build-iphone--ipad).
+
+1. Build `Skate3Recomp.ipa` once with `ios/build.sh` and install it with SideStore, AltStore or Xcode.
+2. Open the app and choose your ISO in the picker. It can sit anywhere in Files, for example in the app's own folder under On My iPhone > Skate 3 Recomp. The game files are extracted on the device. Rebuilding is never needed for this step.
+3. The title update installs itself from the copy bundled at build time.
+4. Play with the on-screen touch controls or any MFi, Xbox, DualSense or Switch controller.
+
 ## Native Renderer
 
 Since v2.0.0 the game no longer relies on emulating the Xbox 360 GPU. A native renderer draws the game directly through Direct3D 12 or Vulkan, covering the entire game: gameplay, menus, HUD, loading screens, videos, and the photo, replay, skater, and park editors. It runs exact ports of the game's own material shading for the world, characters, vehicles, and water, so the image stays at close visual parity with the original console output while running far faster and more efficiently.
@@ -100,6 +110,13 @@ The builds include an experimental true ultrawide mode: the native renderer draw
 - PlayStation (DualShock/DualSense), Switch and most generic controllers are supported through the SDL controller backend: set Settings > Controls > Controller Backend to SDL and restart the game. Steam Input through XInput also works. On Linux and macOS the SDL backend is always used, so these controllers work out of the box.
 - Keyboard controls can be enabled in the game settings menu.
 - Press Escape on keyboard or (RB + Start) on the controller to open the game settings menu. The chord can be changed in Settings > Controls.
+
+- On iOS, on-screen touch controls are shown while no controller is connected:
+  - **Left stick:** steering and pushing. It floats, so its center is wherever your thumb lands.
+  - **Right stick:** a large floating stick marked FLICK, for Flick-It tricks.
+  - **Buttons:** ABXY, which you can slide between without lifting, plus the bumpers, triggers, Back/Start, L3/R3 and the d-pad.
+  - **Menu button:** tap it to open the settings menu. Long-press it to open the layout editor, where you can drag controls, resize or hide them, change the opacity or scale, or reset. Layouts are saved to `Documents/skate3/touch_layout.toml`.
+  - **Controllers:** connecting a controller hides the touch controls, and touching the screen brings them back. To turn them off entirely, set `touch_controls = false` in `Documents/skate3/settings.toml`.
 
 ### Keyboard Keybinds
 
@@ -251,6 +268,62 @@ cmake --build --preset macos-release --parallel
 
 The release artifacts are `out/build/macos-release/skate3` and
 `librexruntime.dylib`, plus the MoltenVK library and ICD manifest beside them.
+
+## iOS Build (iPhone / iPad)
+
+**This build is for personal use only.** The `.ipa` contains code recompiled from
+your own copy of the game, so install it only on your own devices and do not share
+or upload it. The ISO and the title update are never included in this repository.
+
+Requirements:
+
+- A Mac with Xcode, which provides the iOS 26 SDK, `ld` and `codesign`
+- `brew install llvm cmake ninja`. ReXGlue needs upstream Clang; Apple Clang is not supported.
+- An extracted dump of your Skate 3 disc containing `default.xex` and `data/`
+- The Title Update 3 package, `TU_12K2276_000000C000000.00000000000O3`
+- An iPhone or iPad on iOS 26 or later. ProMotion models (iPhone Pro and iPad Pro) can run at 120 fps, and 8 GB RAM models are recommended.
+
+Build:
+
+```sh
+ios/build.sh --game /path/to/your/dump --tu /path/to/TU_12K2276_000000C000000.00000000000O3
+# Add --extended-va if you sign with a paid Apple developer account (see below).
+```
+
+The script performs these steps:
+
+1. It applies the SDK iOS patch from `patches/`.
+2. It runs the recompiler with a macOS host build (`generate-all`).
+3. It downloads a static MoltenVK, unless `VULKAN_SDK` points at the LunarG SDK.
+4. It cross-compiles with the `ios-release` preset.
+5. It writes `out/build/ios-release/Skate3Recomp.ipa`.
+
+You build it once. After that, the ISO is chosen on the device, and you only rebuild after updating this project.
+
+Install:
+
+- **SideStore / AltStore (free Apple ID):** open the `.ipa` in the app. Free accounts must refresh the app every 7 days, which re-signs it without rebuilding.
+- **Xcode (paid or free account):** use Window > Devices and Simulators, then drag the `.app` or `.ipa` onto your device. Re-sign it with your team first if Xcode asks.
+
+Memory and entitlements:
+
+- The app requests `increased-memory-limit` so the Xbox 360's 512 MB of RAM, the recompiled code and the GPU buffers fit in memory.
+- With a free account there is no extended virtual addressing. The runtime then automatically uses a compact guest memory layout: a 4 GB guest span, with the physical view mapped separately.
+- With a paid account, `--extended-va` adds `com.apple.developer.kernel.extended-virtual-addressing` and keeps the desktop layout.
+
+Rendering and power:
+
+- **Renderer:** iOS uses the same native renderer as the desktop builds, running on Metal through a statically linked MoltenVK.
+- **Frame pacing:** presentation is vsynced. On ProMotion displays the guest is paced to the full refresh rate, which is 120 fps.
+- **Low-power waits:** frame pacing sleeps on a precise kernel timer instead of spinning, and the GPU command processor's waits sleep instead of yield-spinning (`gpu_low_power_waits`). Both also apply to macOS.
+- **First-run defaults:** iOS starts at 1x render scale with 2x MSAA and with SSAO and PCSS shadows off, so it can hold 120 fps on battery. Raise these in Settings > Video if your device has headroom.
+- **Backgrounding:** when the app goes to the background, rendering and audio pause.
+
+Known limitations:
+
+- The iOS port is untested on hardware, so expect bugs.
+- Changing a setting that needs a restart closes the app; reopen it from the home screen.
+- Debuggers stop on the guest memory faults the runtime uses for GPU write tracking. In LLDB, run `process handle SIGSEGV SIGBUS -s false -n false -p true`.
 
 ## Running a Development Build
 

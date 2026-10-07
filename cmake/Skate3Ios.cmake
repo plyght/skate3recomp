@@ -13,6 +13,16 @@ option(SKATE3_IOS_EXTENDED_VIRTUAL_ADDRESSING
     "Request com.apple.developer.kernel.extended-virtual-addressing (paid developer account only)"
     OFF)
 
+function(skate3_sign_ios_bundle target_name entitlements)
+    add_custom_command(TARGET ${target_name} POST_BUILD
+        COMMAND codesign --force --sign "${SKATE3_IOS_CODESIGN_IDENTITY}"
+            --entitlements "${entitlements}" --timestamp=none
+            "$<TARGET_BUNDLE_DIR:${target_name}>"
+        COMMENT "Signing skate3.app (${SKATE3_IOS_CODESIGN_IDENTITY})"
+        VERBATIM
+    )
+endfunction()
+
 function(skate3_configure_ios_bundle target_name)
     set(SKATE3_IOS_EXTRA_ENTITLEMENTS "")
     if(SKATE3_IOS_EXTENDED_VIRTUAL_ADDRESSING)
@@ -37,15 +47,13 @@ function(skate3_configure_ios_bundle target_name)
     target_compile_options(${target_name} PRIVATE
         $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 
-    # Sign after the bundle is assembled. Entitlements live in the signature,
-    # which sideloading tools read back when they re-sign with your profile.
-    add_custom_command(TARGET ${target_name} POST_BUILD
-        COMMAND codesign --force --sign "${SKATE3_IOS_CODESIGN_IDENTITY}"
-            --entitlements "${_entitlements}" --timestamp=none
-            "$<TARGET_BUNDLE_DIR:${target_name}>"
-        COMMENT "Signing skate3.app (${SKATE3_IOS_CODESIGN_IDENTITY})"
-        VERBATIM
-    )
+    # Sign after the bundle is assembled: deferred to the end of the directory
+    # so it runs after every other POST_BUILD step that adds files to the
+    # bundle (a later copy would break the sealed resources). Entitlements live
+    # in the signature, which sideloading tools read back when they re-sign
+    # with your profile.
+    cmake_language(EVAL CODE
+        "cmake_language(DEFER CALL skate3_sign_ios_bundle ${target_name} \"${_entitlements}\")")
 
     # skate3-ipa: Payload/skate3.app zipped, ready for SideStore/AltStore.
     set(_ipa_root "${CMAKE_CURRENT_BINARY_DIR}/ipa")

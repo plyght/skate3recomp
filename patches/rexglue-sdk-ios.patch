@@ -258,6 +258,24 @@ index 644fb47..87f66db 100644
    void HandleTextInput(const SDL_TextInputEvent& event,
                         WindowDestructionReceiver& destruction_receiver);
    void RevealAutoHiddenCursor();
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index 690fc8e..766aeca 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -28,7 +28,13 @@
+ #include <rex/math.h>
+ #include <rex/platform.h>
+ 
++#if REX_PLATFORM_IOS
++// Only the ucontext_t/mcontext_t types are needed; iOS marks the <ucontext.h>
++// routines unavailable.
++#include <sys/ucontext.h>
++#else
+ #include <ucontext.h>
++#endif
+ 
+ namespace rex::arch {
+ 
 diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
 index 467c426..8d7fc3c 100644
 --- a/src/core/fiber_posix.cpp

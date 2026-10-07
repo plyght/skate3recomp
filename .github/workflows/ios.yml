@@ -1,0 +1,78 @@
+# Compiles everything in the iOS port that does not need game files: the
+# patched rexglue runtime (static, MoltenVK-backed) and the iOS-only app
+# sources. The recompiled game itself is generated from each user's own
+# disc, so it is never built (or distributed) here.
+name: iOS (no game data)
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths:
+      - ".github/workflows/ios.yml"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "cmake/**"
+      - "ios/**"
+      - "patches/**"
+      - "src/**"
+      - "third_party/**"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ios-runtime:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode with the iOS 26 SDK
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install toolchain
+        run: brew install llvm ninja
+
+      - name: Apply the SDK iOS patch
+        run: ios/apply-sdk-patches.sh
+
+      - name: Fetch static MoltenVK
+        id: moltenvk
+        run: echo "xcframework=$(ios/fetch-moltenvk.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Configure the SDK for iOS
+        run: |
+          cmake -S third_party/rexglue-sdk -B out/ci-ios -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/ios.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DREXGLUE_USE_VULKAN=ON \
+            -DREXGLUE_MOLTENVK_XCFRAMEWORK="${{ steps.moltenvk.outputs.xcframework }}"
+
+      - name: Build the runtime
+        run: cmake --build out/ci-ios --target rexruntime --parallel
+
+      - name: Compile the iOS app sources
+        run: |
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          llvm=/opt/homebrew/opt/llvm
+          includes=(
+            -Isrc -I.
+            -Ithird_party/rexglue-sdk/include
+            -Ithird_party/rexglue-sdk/thirdparty
+            -Ithird_party/rexglue-sdk/thirdparty/fmt/include
+            -Ithird_party/rexglue-sdk/thirdparty/spdlog/include
+            -Ithird_party/rexglue-sdk/thirdparty/tomlplusplus/include
+            -Ithird_party/rexglue-sdk/thirdparty/simde
+            -Ithird_party/rexglue-sdk/thirdparty/imgui
+            -Ithird_party/rexglue-sdk/thirdparty/sdl3/include
+            -Iout/ci-ios/include
+          )
+          common=(--target=arm64-apple-ios26.0 -isysroot "$sdk" -nostdinc++
+                  -isystem "$sdk/usr/include/c++/v1" -std=c++23 -fno-char8_t
+                  -DREX_PLATFORM_MAC=1 -fsyntax-only)
+          "$llvm/bin/clang++" "${common[@]}" "${includes[@]}" src/skate3_touch_controls.cpp
+          "$llvm/bin/clang++" -x objective-c++ -fobjc-arc "${common[@]}" "${includes[@]}" \
+            src/skate3_iso_installer_ios.mm
