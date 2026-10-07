@@ -226,6 +226,25 @@ index c80e029..df5bf54 100644
    static void Trampoline();
  #endif
  };
+diff --git a/include/rex/ui/window.h b/include/rex/ui/window.h
+index 7810986..2c1f3d8 100644
+--- a/include/rex/ui/window.h
++++ b/include/rex/ui/window.h
+@@ -231,6 +231,14 @@ class Window {
+   // refresh rate. Single source of the policy for pacers and settings UI.
+   static float AutoFrameCapHz(float refresh_hz);
+ 
++  // Whether the active swapchain presents with vsync (FIFO, no tearing).
++  // Published by the presenter on swapchain creation. With vsync there is no
++  // tear risk, so AutoFrameCapHz returns the refresh rate itself: pacing a few
++  // fps below it would make a FIFO display repeat a frame every few refreshes
++  // (iOS, where CAMetalLayer always syncs, would never reach a solid 120).
++  static void SetCachedPresentVsynced(bool vsynced);
++  static bool CachedPresentVsynced();
++
+   // Round trips are not guaranteed to return the same results.
+   static constexpr uint32_t ConvertSizeDpi(uint32_t size, uint32_t new_dpi, uint32_t old_dpi) {
+     // Always rounding up to prevent zero sizes (unless the input is zero) as
 diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
 index 467c426..8d7fc3c 100644
 --- a/src/core/fiber_posix.cpp
@@ -497,6 +516,134 @@ index 34a51a9..5816f77 100644
    int flags = MAP_SHARED;
  
    // For file views, we need MAP_FIXED to replace existing reservations.
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a9e0318..ca0dd4b 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -38,6 +38,16 @@
+ 
+ REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
+ 
++// Apple defaults on: the yield loops below keep performance cores awake at
++// full clocks (sched_yield returns immediately when nothing else is runnable),
++// which costs watts on a laptop and battery and heat on a phone. After a short
++// spin the waits fall back to real sleeps; the guest-visible result is the
++// same, only up to ~100 us later.
++REXCVAR_DEFINE_BOOL(gpu_low_power_waits, REX_PLATFORM_MAC != 0, "GPU",
++                    "Sleep instead of yield-spinning while the GPU command processor waits "
++                    "on the guest (idle ring buffer, WAIT_REG_MEM)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+@@ -344,9 +354,12 @@ void CommandProcessor::WorkerThreadMain() {
+       // event is too high.
+       PrepareForWait();
+       uint32_t loop_count = 0;
++      const uint32_t spin_limit = REXCVAR_GET(gpu_low_power_waits) ? 16 : 500;
+       do {
+-        // If we spin around too much, revert to a "low-power" state.
+-        if (loop_count > 500) {
++        // If we spin around too much, revert to a "low-power" state. The
++        // event is signaled on every write pointer update, so the wait ends
++        // as soon as the guest submits more work.
++        if (loop_count > spin_limit) {
+           const int wait_time_ms = 5;
+           rex::thread::Wait(write_ptr_index_event_.get(), true,
+                             std::chrono::milliseconds(wait_time_ms));
+@@ -1276,6 +1289,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+   bool is_memory = (wait_info & 0x10) != 0;
+ 
+   bool matched = false;
++  const bool low_power_waits = REXCVAR_GET(gpu_low_power_waits);
++  uint32_t unmatched_polls = 0;
+   do {
+     uint32_t value = 0;
+     if (is_memory) {
+@@ -1320,11 +1335,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+       // Wait. Attributed separately so time spent blocked on guest-side
+       // progress isn't read as command processing cost.
+       PROFILE_SCOPE_COUNTER(kCpuGuestWaitUs);
++      ++unmatched_polls;
+       if (wait >= 0x100) {
+         PrepareForWait();
+         if (!REXCVAR_GET(vsync)) {
+-          // User wants it fast and dangerous.
+-          rex::thread::MaybeYield();
++          if (low_power_waits && unmatched_polls > 32) {
++            // Waits that outlast a short spin are on the guest CPU or a
++            // vblank; poll at 10 kHz instead of burning a core.
++            rex::thread::Sleep(std::chrono::microseconds(100));
++          } else {
++            // User wants it fast and dangerous.
++            rex::thread::MaybeYield();
++          }
+         } else {
+           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+         }
+@@ -1335,6 +1357,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+           // Short-circuited exit.
+           return false;
+         }
++      } else if (low_power_waits && unmatched_polls > 32) {
++        rex::thread::Sleep(std::chrono::microseconds(100));
+       } else {
+         rex::thread::MaybeYield();
+       }
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 20a31f1..95f3a10 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/platform.h>
+ #include <rex/graphics/graphics_system.h>
+ 
+ #include <algorithm>
+@@ -62,6 +63,16 @@ REXCVAR_DEFINE_INT32(vblank_precise_spin_us, 150, "GPU",
+     .range(0, 1000)
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// Without vsync the guest sees vblank interrupts at this rate. The game does
++// not time its simulation off vblank counts (it runs correctly at 1 kHz), so
++// the rate only bounds how long a vblank wait can take. Each tick wakes a host
++// thread and runs the guest interrupt handler; on Apple 480 Hz (4x a 120 Hz
++// display) keeps waits under ~2 ms while cutting those wakeups by half.
++REXCVAR_DEFINE_DOUBLE(vblank_no_vsync_rate_hz, REX_PLATFORM_MAC ? 480.0 : 1000.0, "GPU",
++                      "Guest vblank interrupt rate while vsync is off")
++    .range(60.0, 1000.0)
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(vblank_no_vsync_use_present_limiter, false, "GPU",
+                     "Use the host present limiter FPS as the guest no-vsync vblank cadence")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -231,7 +242,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+         uint64_t vsync_interval_host_ticks =
+             std::max(uint64_t(1), uint64_t(double(host_tick_frequency) / refresh_rate_hz));
+         auto get_no_vsync_interval_ticks = [](uint64_t frequency) {
+-          double no_vsync_rate_hz = 1000.0;
++          double no_vsync_rate_hz = std::clamp(REXCVAR_GET(vblank_no_vsync_rate_hz), 60.0, 1000.0);
+           if (REXCVAR_GET(vblank_no_vsync_use_present_limiter) &&
+               rex::cvar::Query<bool>("d3d12_present_frame_limiter")) {
+             no_vsync_rate_hz =
+@@ -307,7 +318,13 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+ 
+           current_time = chrono::Clock::QueryGuestTickCount();
+           if (!vsync_enabled) {
+-            rex::thread::Sleep(std::chrono::milliseconds(1));
++            // Sleep to the next tick instead of a fixed 1 ms poll so a lower
++            // vblank_no_vsync_rate_hz also means fewer wakeups.
++            uint64_t sleep_us = next_frame_time > current_time
++                                    ? (next_frame_time - current_time) * 1000000 /
++                                          guest_tick_frequency
++                                    : 0;
++            rex::thread::Sleep(std::chrono::microseconds(std::clamp<uint64_t>(sleep_us, 250, 1000 * 1000 / 60)));
+           } else if (next_frame_time > current_time) {
+             uint64_t sleep_ticks = next_frame_time - current_time;
+             uint64_t sleep_us = sleep_ticks * 1000000 / guest_tick_frequency;
 diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
 index d01f0ed..b468c10 100644
 --- a/src/system/CMakeLists.txt
@@ -752,7 +899,7 @@ index 30ac56f..d732ae5 100644
    // Notify subclass before cleanup
    OnShutdown();
 diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
-index 1e05474..eb2234b 100644
+index 1e05474..f2d9f52 100644
 --- a/src/ui/vulkan/vulkan_instance.cpp
 +++ b/src/ui/vulkan/vulkan_instance.cpp
 @@ -25,6 +25,19 @@
@@ -784,7 +931,24 @@ index 1e05474..eb2234b 100644
    // The Vulkan loader does not discover executable-local MoltenVK manifests by
    // default. Prefer user-provided loader settings, but make release folders run
    // without requiring VK_ICD_FILENAMES in the shell.
-@@ -63,6 +76,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+@@ -54,6 +67,16 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   }
+ #endif
+ 
++#if REX_PLATFORM_MAC
++  // MoltenVK reads its configuration from the environment when the instance is
++  // created. Only defaults are set (overwrite = 0) so users can still A/B them.
++  // - Asynchronous queue submission: vkQueueSubmit returns without waiting for
++  //   MoltenVK to encode the Metal command buffers on the caller's thread.
++  // - Errors-only logging: the info-level stream costs CPU on every pipeline.
++  setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
++  setenv("MVK_CONFIG_LOG_LEVEL", "1", 0);
++#endif
++
+   // Load the RenderDoc API if connected.
+ 
+   vulkan_instance->renderdoc_api_ = RenderDocAPI::CreateIfConnected();
+@@ -63,6 +86,10 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
    Functions& ifn = vulkan_instance->functions_;
  
    bool functions_loaded = true;
@@ -795,7 +959,7 @@ index 1e05474..eb2234b 100644
    if (!vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader)
  #if REX_PLATFORM_MAC
        && !vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoaderFallback)
-@@ -77,6 +94,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+@@ -77,6 +104,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
    XE_VULKAN_LOAD_LOADER_FUNCTION(vkGetInstanceProcAddr);
    XE_VULKAN_LOAD_LOADER_FUNCTION(vkDestroyInstance);
  #undef XE_VULKAN_LOAD_LOADER_FUNCTION
@@ -803,6 +967,84 @@ index 1e05474..eb2234b 100644
    if (!functions_loaded) {
      REXLOG_ERROR("Failed to get Vulkan loader function pointers");
      return nullptr;
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index b404ec8..068d15d 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -27,6 +27,7 @@
+ #include <rex/platform.h>
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
++#include <rex/ui/window.h>
+ 
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+ #include <ffx_api/ffx_api.h>
+@@ -1473,7 +1474,16 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+   // interfering with GPU command processing, and also to allow tearing so
+   // variable refresh rate may be used where it's available.
+   // Note: If the priorities here are changes, update the cvar descriptions.
++#if REX_PLATFORM_IOS
++  // iOS: vsynced FIFO only. CAMetalLayer cannot tear on iOS anyway, and FIFO
++  // lets ProMotion hold a steady 120 Hz with the guest paced to the refresh
++  // rate (see Window::AutoFrameCapHz) instead of racing ahead of the display.
++  constexpr bool allow_immediate_present_mode = false;
++  const bool allow_mailbox_present_mode = false;
++#else
+   constexpr bool allow_immediate_present_mode = true;
++  const bool allow_mailbox_present_mode = REXCVAR_GET(vulkan_allow_present_mode_mailbox);
++#endif
+   if (allow_immediate_present_mode && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
+           present_modes.cend()) {
+@@ -1481,7 +1491,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+     // (though on Windows with borderless fullscreen, GDI copying is used
+     // instead of independent flip, so it's not supported there).
+     swapchain_create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+-  } else if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
++  } else if (allow_mailbox_present_mode &&
+              std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
+                  present_modes.cend()) {
+     // Allowing dropping frames to reduce latency, but no tearing.
+@@ -1515,6 +1525,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+   image_extent_out = swapchain_create_info.imageExtent;
+   is_fifo_out = swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_KHR ||
+                 swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
++  Window::SetCachedPresentVsynced(is_fifo_out);
+   return swapchain;
+ }
+ 
+diff --git a/src/ui/window.cpp b/src/ui/window.cpp
+index 11a6e15..745cd06 100644
+--- a/src/ui/window.cpp
++++ b/src/ui/window.cpp
+@@ -66,8 +66,17 @@ namespace {
+ // Process-wide display refresh cache (see Window::CachedDisplayRefreshHz):
+ // written on the UI thread, read from any thread (frame pacers, settings UI).
+ std::atomic<float> g_display_refresh_hz{0.0f};
++std::atomic<bool> g_present_vsynced{false};
+ }  // namespace
+ 
++void Window::SetCachedPresentVsynced(bool vsynced) {
++  g_present_vsynced.store(vsynced, std::memory_order_relaxed);
++}
++
++bool Window::CachedPresentVsynced() {
++  return g_present_vsynced.load(std::memory_order_relaxed);
++}
++
+ float Window::CachedDisplayRefreshHz() {
+   return g_display_refresh_hz.load(std::memory_order_relaxed);
+ }
+@@ -83,6 +92,9 @@ float Window::AutoFrameCapHz(float refresh_hz) {
+   if (refresh_hz < 30.0f) {
+     return 0.0f;
+   }
++  if (CachedPresentVsynced()) {
++    return std::round(refresh_hz);
++  }
+   // 4 FPS of margin or 5% of the refresh rate, whichever is larger (see the
+   // declaration): 4 FPS is 6.7% of headroom at 60 Hz but only 0.2 ms of
+   // present slack at 144 Hz, within routine thread-scheduling jitter.
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
 index a8bfad9..de930b6 100644
 --- a/src/ui/windowed_app_main_sdl.cpp

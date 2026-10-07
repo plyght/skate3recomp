@@ -411,6 +411,22 @@ void ApplyFirstRunVideoDefaults(const std::filesystem::path& settings_path,
     return;
   }
 
+#if REX_PLATFORM_IOS
+  // Phone GPUs share a few watts with the CPU running the recompiled game.
+  // Start at native 720p internal resolution with the costliest optional
+  // effects off so ProMotion devices can hold 120 fps on battery; everything
+  // can be raised again in Settings > Video.
+  rex::cvar::SetFlagByName("resolution_scale", "1");
+  rex::cvar::SetFlagByName("draw_resolution_scale_x", "1");
+  rex::cvar::SetFlagByName("draw_resolution_scale_y", "1");
+  rex::cvar::SetFlagByName("skate3_native_render_scene_msaa", "2");
+  rex::cvar::SetFlagByName("skate3_native_render_scene_ssao", "false");
+  rex::cvar::SetFlagByName("skate3_native_render_scene_shadow_pcss", "false");
+  rex::cvar::SetFlagByName("skate3_native_render_scene_shadow_static_size", "2048");
+  rex::cvar::SetFlagByName("skate3_draw_distance_scale", "1.0");
+  rex::cvar::SetFlagByName("skate3_lod_distance_scale", "1.0");
+  return;
+#endif
   const auto scale = std::to_string(kDefaultResolutionScale);
   rex::cvar::SetFlagByName("resolution_scale", scale);
   rex::cvar::SetFlagByName("draw_resolution_scale_x", scale);

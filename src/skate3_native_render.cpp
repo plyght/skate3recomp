@@ -26,6 +26,10 @@
 #include <rex/logging.h>
 #include <rex/ui/window.h>
 
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(skate3_native_render, true, "Skate 3",
                     "Enable the Skate 3 data-driven native renderer hook layer")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -255,6 +259,25 @@ void PaceGuestFrame() {
     s_next = now + interval;
     return;
   }
+#if defined(__APPLE__)
+  // mach_wait_until is a precise kernel timer (tens of microseconds on Apple
+  // silicon), so the whole wait sleeps: the yield/spin tail below kept a
+  // performance core busy for ~2 ms of every frame, a large share of the
+  // package power at 120 fps.
+  {
+    const auto remaining = s_next - std::chrono::steady_clock::now();
+    if (remaining > std::chrono::steady_clock::duration::zero()) {
+      static const mach_timebase_info_data_t timebase = [] {
+        mach_timebase_info_data_t info{};
+        mach_timebase_info(&info);
+        return info;
+      }();
+      const uint64_t remaining_ns = uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count());
+      mach_wait_until(mach_absolute_time() + remaining_ns * timebase.denom / timebase.numer);
+    }
+  }
+#else
   // Coarse sleep to ~1.5 ms before the target, then spin for precision.
   while (true) {
     const auto remaining = s_next - std::chrono::steady_clock::now();
@@ -267,6 +290,7 @@ void PaceGuestFrame() {
       std::this_thread::yield();
     }
   }
+#endif
   s_next += interval;
 }
 
