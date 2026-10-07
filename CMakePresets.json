@@ -104,6 +104,28 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "ios-release",
+      "displayName": "iOS Release (device, arm64)",
+      "inherits": "base",
+      "toolchainFile": "${sourceDir}/cmake/ios.toolchain.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "ios-relwithdebinfo",
+      "displayName": "iOS RelWithDebInfo (device, arm64)",
+      "inherits": "ios-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
     }
   ],
   "buildPresets": [
@@ -134,6 +156,14 @@
     {
       "name": "macos-release",
       "configurePreset": "macos-release"
+    },
+    {
+      "name": "ios-release",
+      "configurePreset": "ios-release"
+    },
+    {
+      "name": "ios-relwithdebinfo",
+      "configurePreset": "ios-relwithdebinfo"
     }
   ]
 }

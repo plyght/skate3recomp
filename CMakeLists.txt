@@ -55,6 +55,8 @@ if(WIN32)
     else()
         set(SKATE3_BUILD_PLATFORM "win-${SKATE3_TARGET_PROCESSOR}")
     endif()
+elseif(APPLE AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(SKATE3_BUILD_PLATFORM "ios-arm64")
 elseif(APPLE)
     if(SKATE3_TARGET_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         set(SKATE3_BUILD_PLATFORM "macos-arm64")
@@ -236,8 +238,17 @@ if(WIN32)
     set(REXGLUE_RUNTIME_RC_COPYRIGHT "(c) Skate3Recomp contributors")
 endif()
 
+set(SKATE3_IOS OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(SKATE3_IOS ON)
+endif()
+
 include(cmake/RexGlue.cmake)
-include(cmake/CodegenTargets.cmake)
+if(NOT SKATE3_IOS)
+    # Codegen runs on the build host; iOS consumes the generated/ sources a
+    # macOS build produced (see ios/build.sh).
+    include(cmake/CodegenTargets.cmake)
+endif()
 
 set(SKATE3_COMMON_SOURCES
     src/exception_compat.cpp
@@ -263,7 +274,11 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_win_icon.cpp
     third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp
 )
-if(APPLE)
+if(SKATE3_IOS)
+    list(APPEND SKATE3_COMMON_SOURCES
+        src/skate3_iso_installer_ios.mm
+        src/skate3_touch_controls.cpp)
+elseif(APPLE)
     list(APPEND SKATE3_COMMON_SOURCES src/skate3_iso_installer_macos.mm)
 endif()
 
@@ -286,6 +301,10 @@ if(WIN32)
         @ONLY
     )
     target_sources(skate3 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/skate3.rc)
+elseif(SKATE3_IOS)
+    add_executable(skate3 MACOSX_BUNDLE ${SKATE3_SOURCES})
+    include(cmake/Skate3Ios.cmake)
+    skate3_configure_ios_bundle(skate3)
 else()
     add_executable(skate3 ${SKATE3_SOURCES})
 endif()
@@ -335,6 +354,12 @@ else()
     target_compile_definitions(skate3 PRIVATE SKATE3_HAS_TITLE_UPDATE=0)
 endif()
 
+if(SKATE3_IOS AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/sources.cmake")
+    message(FATAL_ERROR
+        "iOS builds compile the recompiled sources a host build generated. Run the macOS "
+        "generate-all step first (ios/build.sh does both).")
+endif()
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/sources.cmake")
     include(generated/sources.cmake)
     target_sources(skate3 PRIVATE ${GENERATED_SOURCES})
@@ -354,10 +379,17 @@ else()
     message(STATUS "generated/eawebkit/sources.cmake not found; run the generate-all target before building skate3")
 endif()
 
-target_link_libraries(skate3 PRIVATE rex::runtime)
+if(NOT SKATE3_IOS)
+    # On iOS rexglue_configure_target links the static runtime whole-archive;
+    # CMake rejects the same library linked with and without that feature.
+    target_link_libraries(skate3 PRIVATE rex::runtime)
+endif()
 rexglue_configure_target(skate3)
 
-if(APPLE)
+if(SKATE3_IOS)
+    # iOS ignores -stack_size for the main thread; guest work runs on pthreads
+    # with explicit 16 MiB stacks.
+elseif(APPLE)
     target_link_options(skate3 PRIVATE -Wl,-stack_size,0x4000000)
     target_link_libraries(skate3 PRIVATE "-framework Cocoa")
 endif()
@@ -366,17 +398,28 @@ if(WIN32)
     target_link_libraries(skate3 PRIVATE comdlg32 winhttp d3dcompiler gdiplus)
 endif()
 
-add_custom_target(skate3_stage_runtime_library
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:skate3>"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:rexruntime>"
-        "$<TARGET_FILE_DIR:skate3>"
-    DEPENDS rexruntime
-    VERBATIM
-)
-add_dependencies(skate3 skate3_stage_runtime_library)
+if(NOT SKATE3_IOS)
+    add_custom_target(skate3_stage_runtime_library
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:skate3>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:rexruntime>"
+            "$<TARGET_FILE_DIR:skate3>"
+        DEPENDS rexruntime
+        VERBATIM
+    )
+    add_dependencies(skate3 skate3_stage_runtime_library)
+endif()
 
-if(NOT SKATE3_EFFECTIVE_TITLE_UPDATE_PACKAGE STREQUAL "")
+if(SKATE3_IOS AND NOT SKATE3_EFFECTIVE_TITLE_UPDATE_PACKAGE STREQUAL "")
+    # Bundle the user's own TU package; the app stages it into Documents/game
+    # on first launch (TryStageLocalTitleUpdate), so no download is needed.
+    add_custom_command(TARGET skate3 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${SKATE3_EFFECTIVE_TITLE_UPDATE_PACKAGE}"
+            "$<TARGET_FILE_DIR:skate3>/TU_12K2276_000000C000000.00000000000O3"
+        VERBATIM
+    )
+elseif(NOT SKATE3_EFFECTIVE_TITLE_UPDATE_PACKAGE STREQUAL "")
     add_custom_target(skate3_stage_title_update_patches
         COMMAND ${CMAKE_COMMAND} -E make_directory
             "$<TARGET_FILE_DIR:skate3>/game/data/webkit"

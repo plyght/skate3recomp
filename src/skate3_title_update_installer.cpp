@@ -18,6 +18,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
 #include <rex/ui/overlay/acquire_wizard_overlay.h>
 #include <rex/ui/windowed_app_context.h>
 
@@ -49,6 +50,12 @@ namespace skate3 {
 
 #if defined(__APPLE__)
 std::filesystem::path PickTitleUpdateFileMacOS();
+#endif
+#if REX_PLATFORM_IOS
+// skate3_iso_installer_ios.mm: NSURLSession download (iOS has no curl or system()).
+bool DownloadToFileApple(const std::string& url, const std::filesystem::path& destination,
+                         std::atomic<uint64_t>& copied_bytes, std::atomic<uint64_t>& total_bytes,
+                         std::string& error);
 #endif
 
 namespace {
@@ -535,6 +542,15 @@ bool DownloadToFile(const std::string& url, const std::filesystem::path& destina
   }
   WinHttpCloseHandle(session);
   return ok;
+}
+
+#elif REX_PLATFORM_IOS
+
+bool DownloadToFile(const std::string& url, const std::filesystem::path& destination,
+                    std::atomic<uint64_t>& copied_bytes, std::atomic<uint64_t>& total_bytes,
+                    std::string& error) {
+  REXLOG_INFO("Downloading Skate 3 title update via NSURLSession");
+  return DownloadToFileApple(url, destination, copied_bytes, total_bytes, error);
 }
 
 #else

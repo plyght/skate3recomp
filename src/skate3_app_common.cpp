@@ -37,8 +37,13 @@
 #endif
 #include <Windows.h>
 #elif defined(__linux__) || defined(__APPLE__)
-#include <spawn.h>
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
+#include <spawn.h>
+#endif
+#if defined(__APPLE__) && !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
 #include <crt_externs.h>
 #endif
 #endif
@@ -123,7 +128,7 @@ void ApplyDemoPathProfileOverride() {
   rex::cvar::SetFlagByName("user_live_signed_in", "false");
 }
 
-#if defined(__linux__) || defined(__APPLE__)
+#if (defined(__linux__) || defined(__APPLE__)) && !REX_PLATFORM_IOS
 std::vector<std::string> CurrentProcessArgumentsForRestart(
     const std::filesystem::path& executable_path) {
   std::vector<std::string> args;
@@ -422,6 +427,34 @@ void LoadAndNormalizeSimpleSettings(const std::filesystem::path& settings_path,
   rex::ui::EnsureSimpleSettingsConfig(settings_path);
 }
 
+#if REX_PLATFORM_IOS && SKATE3_HAS_TITLE_UPDATE
+// The iOS build bundles the user's own TU package (the same file codegen used)
+// into the app, and also accepts it dropped into Documents via the Files app,
+// so the title update installs without a picker or a network download.
+void TryStageLocalTitleUpdate(const std::filesystem::path& game_root) {
+  if (skate3::IsTitleUpdateInstalled(game_root)) {
+    return;
+  }
+  constexpr std::string_view kTitleUpdatePackage = "TU_12K2276_000000C000000.00000000000O3";
+  const std::filesystem::path candidates[] = {
+      rex::filesystem::GetExecutableFolder() / std::string(kTitleUpdatePackage),
+      rex::filesystem::GetAppRootFolder() / std::string(kTitleUpdatePackage),
+  };
+  for (const auto& candidate : candidates) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(candidate, ec)) {
+      continue;
+    }
+    std::string error;
+    if (skate3::StageTitleUpdateFromFile(candidate, game_root, error)) {
+      REXLOG_INFO("Staged title update from {}", candidate.string());
+      return;
+    }
+    REXLOG_WARN("Could not stage title update from {}: {}", candidate.string(), error);
+  }
+}
+#endif
+
 std::filesystem::path ResolveRuntimeGameDataRoot(const rex::PathConfig& paths) {
   if (!paths.game_data_root.empty()) {
     return paths.game_data_root;
@@ -550,6 +583,10 @@ void Skate3BaseApp::OnConfigureFonts(ImFontAtlas* atlas) {
       "/System/Library/Fonts/HelveticaNeue.ttc",
       "/System/Library/Fonts/LucidaGrande.ttc",
       "/System/Library/Fonts/Supplemental/Arial.ttf",
+      // iOS keeps its system fonts under Core/ and CoreUI/.
+      "/System/Library/Fonts/CoreUI/SFUI.ttf",
+      "/System/Library/Fonts/Core/HelveticaNeue.ttc",
+      "/System/Library/Fonts/Core/Helvetica.ttc",
 #else
       "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
       "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -612,6 +649,9 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
       // Chain the title update wizard after the ISO install completes.
       auto resume_after_title_update =
           [this, resume = std::move(resume)](rex::PathConfig paths) mutable {
+#if REX_PLATFORM_IOS
+            TryStageLocalTitleUpdate(paths.game_data_root);
+#endif
             if (!skate3::IsTitleUpdateInstalled(paths.game_data_root)) {
               skate3::ShowTitleUpdateInstallWizard(imgui_drawer(), std::move(paths),
                                                    std::move(resume));
@@ -643,6 +683,9 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   // TU payloads staged next to the installed game files. Existing installs
   // from releases that predate TU support land here with the game present but
   // the title update missing.
+#if REX_PLATFORM_IOS
+  TryStageLocalTitleUpdate(runtime_paths.game_data_root);
+#endif
   if (!skate3::IsTitleUpdateInstalled(runtime_paths.game_data_root)) {
     REXLOG_INFO("Skate 3 Title Update 3 not staged at {}; launching title update installer",
                 runtime_paths.game_data_root.string());
@@ -976,6 +1019,10 @@ void Skate3BaseApp::RestartGame() {
     }
     CloseHandle(process_info.hThread);
     CloseHandle(process_info.hProcess);
+#elif REX_PLATFORM_IOS
+    // iOS apps cannot launch processes. Settings are already saved; quit and
+    // let the user reopen the app from the home screen to apply them.
+    REXLOG_INFO("Restart requested on iOS: quitting, reopen the app to apply the change");
 #elif defined(__linux__) || defined(__APPLE__)
     const auto executable_path = rex::filesystem::GetExecutablePath();
     if (executable_path.empty()) {
