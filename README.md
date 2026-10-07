@@ -61,7 +61,7 @@ Notes:
 The iOS version has to be built on your own Mac from your own disc, because the
 app contains code recompiled from it. See [iOS Build](#ios-build-iphone--ipad).
 
-1. Build `Skate3Recomp.ipa` once with `ios/build.sh` and install it with SideStore, AltStore or Xcode.
+1. Get `Skate3Recomp.ipa` once: either let GitHub Actions build it from your files (see [iOS cloud build](#ios-cloud-build-no-local-build)), or run `ios/build.sh` on a Mac. Then install it with SideStore, AltStore or Xcode.
 2. Open the app and choose your ISO in the picker. It can sit anywhere in Files, for example in the app's own folder under On My iPhone > Skate 3 Recomp. The game files are extracted on the device. Rebuilding is never needed for this step.
 3. The title update installs itself from the copy bundled at build time.
 4. Play with the on-screen touch controls or any MFi, Xbox, DualSense or Switch controller.
@@ -299,6 +299,35 @@ The script performs these steps:
 5. It writes `out/build/ios-release/Skate3Recomp.ipa`.
 
 You build it once. After that, the ISO is chosen on the device, and you only rebuild after updating this project.
+
+### iOS cloud build (no local build)
+
+GitHub Actions can build the `.ipa` for you on Apple's Macs. This repository is
+public, so the workflow never stores or uploads anything game-derived in the
+clear. Your inputs arrive encrypted, and the finished `.ipa` is encrypted with
+your password before upload. The download expires after 3 days.
+
+1. On any computer with Python 3 and `openssl`, pack the three files the build needs. The script reads `default.xex` and `EAWebkit.xex` straight out of your ISO, so the output is about 30–60 MB, not the whole disc:
+
+   ```sh
+   python3 ios/pack-game-files.py --iso "Skate 3.iso" \
+     --tu TU_12K2276_000000C000000.00000000000O3 -o skate3-build-inputs.enc
+   ```
+
+   Choose a strong password when it asks.
+2. Upload `skate3-build-inputs.enc` somewhere only you have the link to, and get a direct download URL. For example, use a Dropbox link ending in `?dl=1`, or a Google Drive link in the form `https://drive.google.com/uc?export=download&id=<file id>`.
+3. In the repository, go to Settings > Secrets and variables > Actions and add two secrets:
+   - `SKATE3_FILES_URL`: that link
+   - `SKATE3_FILES_PASSWORD`: the password
+4. Go to Actions > **iOS app (.ipa from your game files)** > Run workflow. The build takes a while, as it recompiles the whole game.
+5. Download the `Skate3Recomp-ipa-encrypted` artifact. Unzip it, then run `ios/decrypt-ipa.sh Skate3Recomp.ipa.enc` to get `Skate3Recomp.ipa`. If you don't want to use the script, this command does the same thing:
+
+   ```sh
+   openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -in Skate3Recomp.ipa.enc -out Skate3Recomp.ipa
+   ```
+6. Install the `.ipa` as described below.
+
+Rerun the workflow only after updating this project. Your ISO is picked on the device as usual.
 
 Install:
 

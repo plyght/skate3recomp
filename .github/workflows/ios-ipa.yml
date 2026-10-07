@@ -1,0 +1,100 @@
+# Builds Skate3Recomp.ipa in the cloud from YOUR game files, so no local Mac
+# build is needed. Run it from the Actions tab ("Run workflow").
+#
+# This repository is public, so nothing game-derived is ever stored or
+# uploaded in the clear:
+# - the inputs (default.xex, EAWebkit.xex, title update) arrive as an
+#   AES-encrypted archive made by ios/pack-game-files.py, fetched from a link
+#   you keep in a secret;
+# - the finished .ipa is encrypted with your password before it is uploaded,
+#   and the artifact expires after 3 days.
+#
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#   SKATE3_FILES_URL       direct download link to skate3-build-inputs.enc
+#   SKATE3_FILES_PASSWORD  the password you chose when packing
+name: iOS app (.ipa from your game files)
+
+on:
+  workflow_dispatch:
+    inputs:
+      extended_va:
+        description: "Request extended virtual addressing (paid Apple developer account only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa
+  cancel-in-progress: false
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      SKATE3_FILES_URL: ${{ secrets.SKATE3_FILES_URL }}
+      SKATE3_FILES_PASSWORD: ${{ secrets.SKATE3_FILES_PASSWORD }}
+      # Keep compiler diagnostics (which quote recompiled code) out of the
+      # public log, and stay within the runner's 7 GB of RAM.
+      CXXFLAGS: -w
+      CMAKE_BUILD_PARALLEL_LEVEL: 3
+    steps:
+      - name: Check secrets
+        run: |
+          if [[ -z "$SKATE3_FILES_URL" || -z "$SKATE3_FILES_PASSWORD" ]]; then
+            echo "::error::Add the SKATE3_FILES_URL and SKATE3_FILES_PASSWORD secrets first (see README, iOS cloud build)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Initialize submodules
+        run: ios/ensure-submodules.sh
+
+      - name: Select Xcode with the iOS 26 SDK
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install toolchain
+        run: brew install llvm ninja
+
+      - name: Fetch and decrypt your game files
+        run: |
+          inputs="$RUNNER_TEMP/game"
+          mkdir -p "$inputs"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/inputs.enc" "$SKATE3_FILES_URL"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 \
+            -pass env:SKATE3_FILES_PASSWORD -in "$RUNNER_TEMP/inputs.enc" \
+            | tar -xzf - -C "$inputs"
+          rm -f "$RUNNER_TEMP/inputs.enc"
+          test -f "$inputs/default.xex" -a -f "$inputs/data/webkit/EAWebkit.xex" \
+            || { echo "::error::Archive is missing the .xex files; repack it with ios/pack-game-files.py"; exit 1; }
+
+      - name: Build the app
+        run: |
+          args=(--game "$RUNNER_TEMP/game" --tu "$RUNNER_TEMP/game/TU_12K2276_000000C000000.00000000000O3")
+          if [[ "${{ inputs.extended_va }}" == "true" ]]; then
+            args+=(--extended-va)
+          fi
+          ios/build.sh "${args[@]}"
+
+      - name: Encrypt the .ipa
+        run: |
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 -salt \
+            -pass env:SKATE3_FILES_PASSWORD \
+            -in out/build/ios-release/Skate3Recomp.ipa \
+            -out "$RUNNER_TEMP/Skate3Recomp.ipa.enc"
+
+      - name: Remove plaintext game-derived files
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/game" generated out/build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Skate3Recomp-ipa-encrypted
+          path: ${{ runner.temp }}/Skate3Recomp.ipa.enc
+          retention-days: 3
+          if-no-files-found: error
