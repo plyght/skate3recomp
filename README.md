@@ -306,13 +306,17 @@ iOS cannot compile or JIT code on the device, so the game's recompiled code has
 to be built into the app once. GitHub Actions can do that from your copy of the
 game, and every step can be done from your phone:
 
-1. Put your Skate 3 ISO in iCloud Drive, Google Drive or Dropbox and copy a direct download link. For Dropbox, use a link ending in `?dl=1`.
+1. Put your Skate 3 ISO in iCloud Drive, Google Drive or Dropbox and copy a direct download link. For Dropbox, use a link ending in `?dl=1`. If you already installed the desktop version, zipping its `game` folder works too: on a Mac, right-click it and choose Compress. You don't need the ISO.
 2. Paste that link into the **iso_url** box when you run the workflow in step 4. In a public repository, store the link as the secret `SKATE3_ISO_URL` instead (Settings > Secrets and variables > Actions); anyone who can see a run can read what was typed into the form.
 3. If the repository is public, also add the secret `SKATE3_FILES_PASSWORD`. Anyone can download the artifacts of a public repository, so the `.ipa` is encrypted with this password. To skip this step, make the repository private and the `.ipa` is uploaded as-is.
 4. Go to Actions > **iOS app (.ipa from your game files)** > Run workflow.
 5. Download the `Skate3Recomp-ipa` artifact and open the `.ipa` in SideStore. If you got the encrypted `.ipa.enc`, decrypt it first with `ios/decrypt-ipa.sh`.
 
-Only `default.xex` and `EAWebkit.xex` are read from the ISO. The title update is
+Only `default.xex` and `EAWebkit.xex` are read from the ISO or zip.
+
+On the phone, you can also skip the ISO entirely: copy the desktop `game` folder
+to Files > On My iPhone > Skate 3 Recomp > `game`. The app finds it on launch and
+goes straight to the game, with the title update already applied. The title update is
 downloaded automatically. You pick the ISO again inside the app on first launch;
 that copy is where the game's art and other files come from.
 

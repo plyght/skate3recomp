@@ -1,6 +1,7 @@
 # Builds Skate3Recomp.ipa in the cloud from YOUR copy of the game - no Mac
 # needed. Everything can be done from a phone:
-#   1. Share your Skate 3 ISO from iCloud Drive / Google Drive / Dropbox.
+#   1. Share your Skate 3 ISO - or a zip of the "game" folder from a desktop
+#      install - from iCloud Drive / Google Drive / Dropbox.
 #   2. Actions > "iOS app" > Run workflow, and paste its direct download link
 #      (or store the link as the secret SKATE3_ISO_URL - required to keep it
 #      hidden in a public repository).
@@ -20,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       iso_url:
-        description: "Direct download link to your Skate 3 ISO (or leave empty to use the SKATE3_ISO_URL secret). Visible to anyone who can see this run - use the secret in a public repo."
+        description: "Direct download link to your Skate 3 ISO, or to a zip of the desktop game folder (empty = use the SKATE3_ISO_URL secret). Visible to anyone who can see this run - use the secret in a public repo."
         type: string
         required: false
       extended_va:
@@ -52,7 +53,7 @@ jobs:
       - name: Check secrets
         run: |
           if [[ -z "$SKATE3_ISO_URL" && -z "$SKATE3_FILES_URL" ]]; then
-            echo "::error::Add the secret SKATE3_ISO_URL (a direct download link to your Skate 3 ISO)."
+            echo "::error::Paste a link to your ISO or zipped game folder into iso_url, or add the secret SKATE3_ISO_URL."
             exit 1
           fi
           if [[ "$REPO_PRIVATE" != "true" && -z "$SKATE3_FILES_PASSWORD" ]]; then
@@ -78,16 +79,35 @@ jobs:
           inputs="$RUNNER_TEMP/game"
           mkdir -p "$inputs/data/webkit"
           if [[ -n "$SKATE3_ISO_URL" ]]; then
-            # Pull the two executables out of the ISO, then delete it right away
-            # (runner disk is limited and nothing else from the disc is needed).
+            # The link may be the ISO or a zip of an installed desktop "game"
+            # folder. Either way only default.xex and EAWebkit.xex are kept,
+            # and the download is deleted right away (runner disk is limited).
             curl -fsSL --retry 3 -o "$RUNNER_TEMP/game.iso" "$SKATE3_ISO_URL"
             python3 -I - "$RUNNER_TEMP/game.iso" "$inputs" ios/pack-game-files.py <<'PY'
-          import importlib.util, pathlib, sys
-          iso, out, packer = sys.argv[1:4]
-          spec = importlib.util.spec_from_file_location("packer", packer)
-          mod = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mod)
-          for name, data in mod.find_files(iso).items():
+          import importlib.util, pathlib, sys, zipfile
+          src, out, packer = sys.argv[1:4]
+          wanted = ("default.xex", "data/webkit/EAWebkit.xex")
+          if zipfile.is_zipfile(src):
+              with zipfile.ZipFile(src) as z:
+                  names = [n for n in z.namelist() if not n.startswith("__MACOSX/")]
+                  lower = {n.lower(): n for n in names}
+                  # The game folder may sit at any depth inside the zip.
+                  roots = [n[: -len("default.xex")] for n in names
+                           if n.lower().endswith("default.xex")]
+                  files = {}
+                  for root in roots:
+                      hits = {w: lower.get((root + w).lower()) for w in wanted}
+                      if all(hits.values()):
+                          files = {w: z.read(hits[w]) for w in wanted}
+                          break
+                  if not files:
+                      sys.exit("error: the zip has no default.xex + data/webkit/EAWebkit.xex")
+          else:
+              spec = importlib.util.spec_from_file_location("packer", packer)
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              files = mod.find_files(src)
+          for name, data in files.items():
               path = pathlib.Path(out) / name
               path.parent.mkdir(parents=True, exist_ok=True)
               path.write_bytes(data)
